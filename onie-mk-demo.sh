@@ -52,7 +52,7 @@ fi
 }
 
 case $demo_type in
-    OS|DIAG)
+    OS|DIAG|RESCUE)
         # These are supported
         ;;
     *)
@@ -85,6 +85,11 @@ cp onie-image-$arch.conf $tmp_installdir
 # Set sonic fips config for the installer script
 if [ "$ENABLE_FIPS" = "y" ]; then
     EXTRA_CMDLINE_LINUX="$EXTRA_CMDLINE_LINUX sonic_fips=1"
+fi
+
+# Set sonic rescue flag in kernel cmdline for RESCUE images
+if [ "$demo_type" = "RESCUE" ]; then
+    EXTRA_CMDLINE_LINUX="$EXTRA_CMDLINE_LINUX sonic_rescue=1"
 fi
 
 # Escape special chars in the user provide kernel cmdline string for use in
