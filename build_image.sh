@@ -97,6 +97,32 @@ generate_onie_installer_image()
           $INSTALLER_PAYLOAD $SECURE_UPGRADE_SIGNING_CERT $SECURE_UPGRADE_DEV_SIGNING_KEY
 }
 
+generate_rescue_installer_image()
+{
+    output_file=$OUTPUT_RESCUE_IMAGE
+    [ -n "$1" ] && output_file=$1
+    # Copy platform-specific ONIE installer config files where onie-mk-demo.sh expects them
+    rm -rf ./installer/platforms/
+    mkdir -p ./installer/platforms/
+    for VENDOR in `ls ./device`; do
+        for PLATFORM in `ls ./device/$VENDOR | grep ^${TARGET_PLATFORM}`; do
+            if [ -f ./device/$VENDOR/$PLATFORM/installer.conf ]; then
+                cp ./device/$VENDOR/$PLATFORM/installer.conf ./installer/platforms/$PLATFORM
+            fi
+        done
+    done
+
+    platform_conf_file="platform/$TARGET_MACHINE/platform_${CONFIGURED_ARCH}.conf"
+    if [ ! -f $platform_conf_file ]; then
+        platform_conf_file="platform/$TARGET_MACHINE/platform.conf"
+    fi
+    ## Generate a SONiC rescue live installer image (RESCUE demo_type, no disk install)
+    ## Note: Don't leave blank between lines. It is single line command.
+    ./onie-mk-demo.sh $CONFIGURED_ARCH $TARGET_MACHINE $TARGET_PLATFORM-$TARGET_MACHINE-$ONIEIMAGE_VERSION \
+          installer $platform_conf_file $output_file RESCUE $IMAGE_VERSION $ONIE_IMAGE_PART_SIZE \
+          $INSTALLER_PAYLOAD $SECURE_UPGRADE_SIGNING_CERT $SECURE_UPGRADE_DEV_SIGNING_KEY
+}
+
 # Generate asic-specific device list
 generate_device_list()
 {
@@ -268,6 +294,15 @@ elif [ "$IMAGE_TYPE" = "bfb" ]; then
     sudo -E ./platform/${CONFIGURED_PLATFORM}/installer/create_sonic_image --kernel $KVERSION "$secure_upgrade_keys"
 
     sudo chown $USER $OUTPUT_BFB_IMAGE
+
+elif [ "$IMAGE_TYPE" = "rescue" ]; then
+    echo "Build SONiC Rescue Live installer"
+    mkdir -p `dirname $OUTPUT_RESCUE_IMAGE`
+    sudo rm -f $OUTPUT_RESCUE_IMAGE
+
+    generate_device_list "./installer/platforms_asic"
+
+    generate_rescue_installer_image
 
 else
     echo "Error: Non supported image type $IMAGE_TYPE"

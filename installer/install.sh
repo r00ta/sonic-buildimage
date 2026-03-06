@@ -168,6 +168,97 @@ fi
 
 image_dir="image-$image_version"
 
+# Handle RESCUE mode: boot into a live in-memory rescue environment.
+# No disk partitioning or installation is performed.
+if [ "$demo_type" = "RESCUE" ]; then
+    echo "SONiC Rescue Live: setting up in-memory rescue environment..."
+    echo "Note: no data will be written to disk; all changes are RAM-only."
+
+    installer_dir="$(cd "$(dirname "$0")" && pwd)"
+
+    # Allocate a tmpfs to hold the squashfs image
+    rescue_squashfs_dir=$(mktemp -d)
+    if ! mount -t tmpfs -o size=2G tmpfs "$rescue_squashfs_dir"; then
+        echo "Error: Failed to create tmpfs for squashfs storage"
+        exit 1
+    fi
+
+    # Extract fs.squashfs from the installer payload (fs.zip)
+    echo "Extracting $FILESYSTEM_SQUASHFS from $INSTALLER_PAYLOAD..."
+    if ! unzip -op "$installer_dir/$INSTALLER_PAYLOAD" "$FILESYSTEM_SQUASHFS" \
+            > "$rescue_squashfs_dir/fs.squashfs"; then
+        echo "Error: Failed to extract $FILESYSTEM_SQUASHFS from $INSTALLER_PAYLOAD"
+        umount "$rescue_squashfs_dir" 2>/dev/null || true
+        rmdir "$rescue_squashfs_dir" 2>/dev/null || true
+        exit 1
+    fi
+
+    # Verify the squashfs file is non-empty
+    if [ ! -s "$rescue_squashfs_dir/fs.squashfs" ]; then
+        echo "Error: Extracted $FILESYSTEM_SQUASHFS is empty or missing"
+        umount "$rescue_squashfs_dir" 2>/dev/null || true
+        rmdir "$rescue_squashfs_dir" 2>/dev/null || true
+        exit 1
+    fi
+
+    # Mount squashfs read-only as the lower layer of the overlay
+    rescue_lower=$(mktemp -d)
+    if ! mount -t squashfs -o loop,ro "$rescue_squashfs_dir/fs.squashfs" \
+            "$rescue_lower"; then
+        echo "Error: Failed to mount $FILESYSTEM_SQUASHFS"
+        umount "$rescue_squashfs_dir" 2>/dev/null || true
+        rmdir "$rescue_squashfs_dir" "$rescue_lower" 2>/dev/null || true
+        exit 1
+    fi
+    echo "Mounted squashfs at $rescue_lower"
+
+    # Create tmpfs for the writable overlay upper and work directories
+    rescue_overlay_base=$(mktemp -d)
+    mount -t tmpfs tmpfs "$rescue_overlay_base"
+    mkdir -p "$rescue_overlay_base/upper" "$rescue_overlay_base/work"
+
+    # Mount overlayfs: squashfs (lower) + tmpfs (upper/work)
+    rescue_root=$(mktemp -d)
+    if ! mount -t overlay overlay \
+        -o "lowerdir=${rescue_lower},upperdir=${rescue_overlay_base}/upper,workdir=${rescue_overlay_base}/work" \
+        "$rescue_root"; then
+        echo "Error: Failed to mount overlayfs"
+        umount "$rescue_lower" 2>/dev/null || true
+        umount "$rescue_overlay_base" 2>/dev/null || true
+        umount "$rescue_squashfs_dir" 2>/dev/null || true
+        rmdir "$rescue_root" "$rescue_overlay_base" \
+              "$rescue_lower" "$rescue_squashfs_dir" 2>/dev/null || true
+        exit 1
+    fi
+    echo "Overlayfs mounted at $rescue_root (tmpfs writable layer, not persistent)"
+
+    # Bind-mount essential pseudo-filesystems into the new root
+    mkdir -p "$rescue_root/proc" "$rescue_root/sys" "$rescue_root/dev" \
+             "$rescue_root/dev/pts"
+    mount -t proc proc "$rescue_root/proc" 2>/dev/null || true
+    mount -t sysfs sysfs "$rescue_root/sys" 2>/dev/null || true
+    mount --bind /dev "$rescue_root/dev" 2>/dev/null || true
+    mount --bind /dev/pts "$rescue_root/dev/pts" 2>/dev/null || true
+
+    # Install the sonic-rescue script into the new root
+    rescue_script="$installer_dir/rescue-live/sonic-rescue"
+    rescue_dest="/usr/local/sbin/sonic-rescue"
+    if [ -f "$rescue_script" ]; then
+        mkdir -p "$rescue_root/$(dirname "$rescue_dest")"
+        cp "$rescue_script" "$rescue_root/$rescue_dest"
+        chmod +x "$rescue_root/$rescue_dest"
+    else
+        echo "Warning: $rescue_script not found; will try $rescue_dest in squashfs"
+        if [ ! -x "$rescue_root/$rescue_dest" ]; then
+            echo "Error: sonic-rescue not found in squashfs either"
+            exit 1
+        fi
+    fi
+
+    echo "Entering SONiC Rescue Shell (chroot into $rescue_root)..."
+    exec chroot "$rescue_root" "$rescue_dest"
+fi
+
 if [ "$install_env" = "onie" ]; then
     # Create/format the flash
     create_partition

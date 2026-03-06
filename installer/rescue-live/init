@@ -1,0 +1,83 @@
+#!/bin/sh
+# SONiC Rescue Live - init script
+#
+# This script is the init entrypoint for the SONiC rescue live environment.
+# It is designed to run as PID 1 in an initramfs context. It mounts the
+# SONiC root filesystem from fs.squashfs as a read-only lower layer, creates
+# a writable tmpfs+overlayfs on top, then calls switch_root into the new root
+# running sonic-rescue as the init process.
+#
+# Expected initramfs layout:
+#   /init              -> this script
+#   /sonic-rescue      -> the rescue shell script (copied to new root)
+#   /fs.squashfs       -> the SONiC root filesystem image
+
+set -e
+
+SQUASHFS_PATH=/fs.squashfs
+LOWER_MNT=/mnt/lower
+UPPER_BASE=/mnt/upper
+UPPER_DIR=/mnt/upper/upper
+WORK_DIR=/mnt/upper/work
+ROOT_MNT=/mnt/root
+RESCUE_SCRIPT=/sonic-rescue
+RESCUE_DEST=/usr/local/sbin/sonic-rescue
+
+# Mount essential pseudo-filesystems
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || mount -t tmpfs tmpfs /dev
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts 2>/dev/null || true
+
+echo "[rescue-init] Starting SONiC Rescue Live..."
+
+# Verify squashfs is present
+if [ ! -f "$SQUASHFS_PATH" ]; then
+    echo "[rescue-init] ERROR: $SQUASHFS_PATH not found. Cannot boot rescue environment."
+    echo "[rescue-init] Dropping to emergency shell. Type 'exit' to reboot."
+    exec /bin/sh
+fi
+
+# Mount squashfs read-only as the lower layer
+mkdir -p "$LOWER_MNT"
+if ! mount -t squashfs -o loop,ro "$SQUASHFS_PATH" "$LOWER_MNT"; then
+    echo "[rescue-init] ERROR: Failed to mount $SQUASHFS_PATH"
+    echo "[rescue-init] Dropping to emergency shell."
+    exec /bin/sh
+fi
+echo "[rescue-init] Mounted squashfs at $LOWER_MNT"
+
+# Create tmpfs for the writable overlay upper and work directories
+mkdir -p "$UPPER_BASE"
+mount -t tmpfs tmpfs "$UPPER_BASE"
+mkdir -p "$UPPER_DIR" "$WORK_DIR"
+
+# Mount overlayfs combining read-only squashfs with writable tmpfs
+mkdir -p "$ROOT_MNT"
+if ! mount -t overlay overlay \
+    -o "lowerdir=${LOWER_MNT},upperdir=${UPPER_DIR},workdir=${WORK_DIR}" \
+    "$ROOT_MNT"; then
+    echo "[rescue-init] ERROR: Failed to mount overlayfs"
+    echo "[rescue-init] Dropping to emergency shell."
+    umount "$LOWER_MNT" 2>/dev/null || true
+    exec /bin/sh
+fi
+echo "[rescue-init] Overlayfs mounted at $ROOT_MNT (writable overlay on tmpfs)"
+
+# Prepare /proc /sys /dev mount points in the new root
+mkdir -p "$ROOT_MNT/proc" "$ROOT_MNT/sys" "$ROOT_MNT/dev" "$ROOT_MNT/dev/pts"
+
+# Install the sonic-rescue script into the new root filesystem
+if [ -f "$RESCUE_SCRIPT" ]; then
+    mkdir -p "$ROOT_MNT/$(dirname "$RESCUE_DEST")"
+    cp "$RESCUE_SCRIPT" "$ROOT_MNT/$RESCUE_DEST"
+    chmod +x "$ROOT_MNT/$RESCUE_DEST"
+    echo "[rescue-init] Installed $RESCUE_DEST in new root"
+else
+    echo "[rescue-init] WARNING: $RESCUE_SCRIPT not found; will attempt to use existing $RESCUE_DEST in squashfs"
+fi
+
+# Switch to the new root, running sonic-rescue as init
+echo "[rescue-init] Switching root to $ROOT_MNT, running $RESCUE_DEST as init..."
+exec switch_root "$ROOT_MNT" "$RESCUE_DEST"

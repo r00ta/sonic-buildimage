@@ -1,0 +1,117 @@
+#!/bin/sh
+# SONiC Rescue Shell
+#
+# This script runs inside the rescue root filesystem (from squashfs + overlayfs).
+# It loads a reasonable set of kernel modules for generic amd64 hardware,
+# brings up network interfaces with DHCP (best-effort), and then drops to an
+# interactive rescue shell.
+#
+# The root filesystem is backed by squashfs (read-only) with a tmpfs writable
+# overlay. Changes are NOT persisted across reboots.
+#
+# Usage:
+#   - This script is normally invoked automatically as init (PID 1) by the
+#     rescue-live/init entrypoint after switch_root.
+#   - It can also be invoked by installer/install.sh during ONIE rescue boot
+#     via exec chroot into the rescue root.
+#
+# To manually run DHCP on a specific interface after boot:
+#   dhclient <interface>
+#   e.g.: dhclient eth0
+
+# If we are PID 1 (running as init after switch_root), mount essential
+# pseudo-filesystems before doing anything else.
+if [ $$ -eq 1 ]; then
+    mount -t proc proc /proc 2>/dev/null || true
+    mount -t sysfs sysfs /sys 2>/dev/null || true
+    mount -t devtmpfs devtmpfs /dev 2>/dev/null || \
+        mount -t tmpfs tmpfs /dev 2>/dev/null || true
+    mkdir -p /dev/pts
+    mount -t devpts devpts /dev/pts 2>/dev/null || true
+fi
+
+echo "============================================================"
+echo "  SONiC Rescue Live Shell"
+echo "  Root FS : squashfs (read-only)"
+echo "  Overlay : tmpfs (writable, NOT persistent)"
+echo "  Changes will be lost on reboot."
+echo "============================================================"
+echo ""
+
+# Load kernel modules for common amd64 network and storage hardware
+echo "[rescue] Loading kernel modules..."
+
+# Network drivers
+for mod in e1000 e1000e igb ixgbe i40e ice \
+           virtio_net vmxnet3 tg3 bnx2 bnx2x \
+           mlx4_core mlx4_en mlx5_core mlx5_en \
+           8021q bonding; do
+    modprobe "$mod" 2>/dev/null && echo "[rescue]   loaded: $mod" || true
+done
+
+# Storage / platform drivers
+for mod in ahci libata scsi_mod sd_mod \
+           i2c-core ipmi_msghandler; do
+    modprobe "$mod" 2>/dev/null && echo "[rescue]   loaded: $mod" || true
+done
+
+echo "[rescue] Module loading complete."
+echo ""
+
+# Bring up the loopback interface
+if command -v ip >/dev/null 2>&1; then
+    ip link set lo up 2>/dev/null || true
+elif command -v ifconfig >/dev/null 2>&1; then
+    ifconfig lo up 2>/dev/null || true
+fi
+
+# Attempt DHCP on all non-loopback Ethernet interfaces (best-effort)
+echo "[rescue] Attempting DHCP on network interfaces..."
+dhcp_ok=0
+
+for iface in $(ls /sys/class/net/ 2>/dev/null); do
+    # Skip loopback
+    [ "$iface" = "lo" ] && continue
+
+    # Skip virtual/bridge/bond interfaces (optional, uncomment to skip)
+    # echo "$iface" | grep -qE '^(br|bond|dummy|veth)' && continue
+
+    echo "[rescue]   Bringing up $iface..."
+    if command -v ip >/dev/null 2>&1; then
+        ip link set "$iface" up 2>/dev/null || true
+    else
+        ifconfig "$iface" up 2>/dev/null || true
+    fi
+
+    echo "[rescue]   Running dhclient on $iface (timeout 10s)..."
+    if command -v dhclient >/dev/null 2>&1; then
+        if dhclient -v -timeout 10 "$iface" 2>/dev/null; then
+            echo "[rescue]   DHCP success on $iface"
+            dhcp_ok=1
+        else
+            echo "[rescue]   DHCP failed on $iface (continuing)"
+        fi
+    else
+        echo "[rescue]   dhclient not found; skipping DHCP on $iface"
+    fi
+done
+
+echo ""
+if [ "$dhcp_ok" = "1" ]; then
+    echo "[rescue] Network is up. IP address(es):"
+    if command -v ip >/dev/null 2>&1; then
+        ip addr show 2>/dev/null | grep 'inet ' || true
+    else
+        ifconfig 2>/dev/null | grep 'inet ' || true
+    fi
+else
+    echo "[rescue] DHCP not obtained on any interface."
+    echo "[rescue] To manually configure: dhclient <interface>"
+fi
+echo ""
+
+echo "[rescue] Dropping to rescue shell. Type 'exit' to halt/reboot."
+echo ""
+
+# Drop to the best available interactive shell
+exec /bin/bash 2>/dev/null || exec /bin/sh
